@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Models (downloaded by setup, not committed)
+models/*.task
+models/*.onnx
+models/*.dat
+models/*.pb
+models/*.pbtxt
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
