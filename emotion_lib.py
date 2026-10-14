@@ -1,17 +1,20 @@
 """Shared inference + analysis helpers for the webcam emotion tools.
 
-Two scripts use this:
-  - webcam_emotion.py  (the mirror/viewer)
-  - emotion_simon.py   (the game with modes)
+actor_coach.py renders; this module does inference, AU computation, emotion
+labeling, and target scoring.
 
-The goal of this file is to keep inference, AU computation, and emotion
-labeling in one place so the UI scripts only have to render.
+Two layers of emotion live here:
+  - the 8 HSEmotion classes (what the classifier sees), and
+  - the extended "emotion wheel" targets, scored from FACS-style blendshape
+    recipes plus head pose and gaze — see WHEEL_SPECS and guides.md.
 """
 from __future__ import annotations
 
+import math
 import urllib.request  # noqa: F401 — hsemotion_onnx package has a missing-import bug
 
 import cv2
+import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
@@ -26,6 +29,12 @@ AU_ASYMMETRY_THRESHOLD = 0.20
 # The 7 acting-relevant emotion classes (Neutral excluded from game targets).
 EMOTION_TARGETS = ["Happiness", "Sadness", "Anger", "Fear", "Surprise", "Disgust", "Contempt"]
 ALL_EMOTIONS = EMOTION_TARGETS + ["Neutral"]
+
+# Head-pose thresholds (degrees) used by the wheel recipes.
+HEAD_TILT_DEG = 8.0      # ear toward shoulder (FACS 55/56)
+HEAD_PITCH_DEG = 8.0     # chin up (53) / chin down (54)
+HEAD_TURN_DEG = 10.0     # head turned (51/52)
+GAZE_THRESHOLD = 0.30    # eyeLook* blendshape level that counts as a gaze shift
 
 # Plutchik-style intensity tiers per HSE class label.
 INTENSITY_TIERS = {
@@ -90,7 +99,186 @@ TARGET_HINTS = {
     "Surprise":  "brows up, eyes wide, jaw drop (brows parallel)",
     "Disgust":   "wrinkle the nose, upper lip up",
     "Contempt":  "one-sided smirk (asymmetric)",
+    # wheel targets
+    "Curious":      "brows up, hint of a smile, tilt the head",
+    "Excited":      "brows up, eyes wide, big smile, mouth open",
+    "Amused":       "laugh: cheeks up, jaw open, head back",
+    "Content":      "soft closed-mouth smile, heavy lids, slow breath",
+    "Proud":        "small smile, lips pressed, chin up",
+    "Loving":       "warm Duchenne smile, head tilted",
+    "Awe":          "brows up, eyes wide, jaw open, chin up, half-smile",
+    "Relieved":     "exhale through puckered lips, lids soften",
+    "Bored":        "heavy lids, head tilted or dropped, no smile",
+    "Confused":     "brows down, eyes narrowed, head tilted",
+    "Embarrassed":  "suppressed smile, head down, look away",
+    "Ashamed":      "head down, eyes down, brows down, chin pushed up",
+    "Sympathetic":  "inner brows up, lips pressed, chin raised, lean in",
+    "Pain":         "brows down, eyes clamped, nose wrinkled, lips stretched",
+    "Coy":          "Duchenne smile, head down + turned, eyes peek",
+    "Anxious":      "inner brows up + together, lips stretched, eyes dart",
 }
+
+# --- extended "emotion wheel" targets --------------------------------------
+# Each wheel target is a recipe of cues scored against the analysis dict:
+#   ("au",   [names])         any listed blendshape active; (name, thr) overrides
+#   ("not",  [names])         all listed blendshapes inactive
+#   ("tilt" | "turn" | "chin_up" | "chin_down", degrees)   head pose
+#   ("gaze", "down"|"up"|"averted", thr)
+#   ("asym", (left, right), thr)   left/right difference
+#   ("any",  [cues])          at least one sub-cue passes
+# `hard` cues must all pass; `soft` cues must reach min_frac (default
+# AU_FRACTION_THRESHOLD). `family` lists HSE classes any of which must clear
+# CLASS_PROB_THRESHOLD — a valence/arousal sanity gate, since the classifier
+# has no "curious" class of its own.
+# AU sources: Cordaro et al. 2018 (Emotion 18:75) international core
+# sequences; Keltner, Sauter, Tracy & Cowen 2019 (J Nonverbal Behav 43:133)
+# Table 2; Shiota, Campos & Keltner 2003 — details per emotion in guides.md.
+_SMILE = ["mouthSmileLeft", "mouthSmileRight"]
+_SLIGHT_SMILE = [("mouthSmileLeft", 0.12), ("mouthSmileRight", 0.12)]
+_CHEEK = ["cheekSquintLeft", "cheekSquintRight"]
+_SQUINT = ["eyeSquintLeft", "eyeSquintRight"]
+_WIDE = ["eyeWideLeft", "eyeWideRight"]
+_BROW_UP = ["browInnerUp", "browOuterUpLeft", "browOuterUpRight"]
+_BROW_DOWN = ["browDownLeft", "browDownRight"]
+_PRESS = ["mouthPressLeft", "mouthPressRight"]
+_STRETCH = ["mouthStretchLeft", "mouthStretchRight"]
+_NOSE = ["noseSneerLeft", "noseSneerRight"]
+_LIDS_DROOP = [("eyeBlinkLeft", 0.20), ("eyeBlinkRight", 0.20)]   # partial AU 43
+_JAW = ["jawOpen"]
+_PUCKER = ["mouthPucker", "mouthFunnel"]
+# "control smile" (Cordaro): AU 12 + a dampener (14/15/23/24, lip roll)
+_DAMPENER = ["mouthDimpleLeft", "mouthDimpleRight", "mouthFrownLeft", "mouthFrownRight",
+             "mouthPressLeft", "mouthPressRight", "mouthRollLower", "mouthRollUpper"]
+_LOOK_AWAY = ("any", [("gaze", "down", GAZE_THRESHOLD), ("gaze", "averted", GAZE_THRESHOLD),
+                      ("turn", HEAD_TURN_DEG)])
+
+WHEEL_SPECS = {
+    "Curious": dict(
+        wheel="Plutchik: anticipation petal, low tier (interest)",
+        family=["Neutral", "Happiness", "Surprise"],
+        soft=[("au", _BROW_UP), ("au", _SLIGHT_SMILE), ("tilt", HEAD_TILT_DEG)],
+        hard=[("not", [("jawOpen", 0.40)]), ("not", [("eyeWideLeft", 0.50), ("eyeWideRight", 0.50)])],
+        min_frac=0.67,
+    ),
+    "Excited": dict(
+        wheel="Plutchik dyad joy + surprise (delight); feelings wheel: happy -> excited",
+        family=["Happiness", "Surprise"],
+        soft=[("au", _BROW_UP), ("au", _WIDE), ("au", _SMILE), ("au", _JAW)],
+        hard=[],
+        min_frac=0.75,
+    ),
+    "Amused": dict(
+        wheel="feelings wheel: happy -> amused / playful",
+        family=["Happiness"],
+        soft=[("au", _CHEEK), ("au", _SMILE), ("chin_up", HEAD_PITCH_DEG)],
+        hard=[("au", [("jawOpen", 0.20)])],
+        min_frac=0.67,
+    ),
+    "Content": dict(
+        wheel="Plutchik: joy petal, low tier (serenity); feelings wheel: peaceful -> content",
+        family=["Happiness", "Neutral"],
+        soft=[("au", _SLIGHT_SMILE), ("au", _LIDS_DROOP)],
+        hard=[("not", [("jawOpen", 0.30)])],
+        min_frac=1.0,
+    ),
+    "Proud": dict(
+        wheel="feelings wheel: powerful -> proud / confident",
+        family=["Happiness", "Neutral"],
+        soft=[("au", _SLIGHT_SMILE), ("au", _PRESS), ("au", _CHEEK)],
+        hard=[("chin_up", HEAD_PITCH_DEG)],
+        min_frac=0.67,
+    ),
+    "Loving": dict(
+        wheel="Plutchik dyad joy + trust (love); feelings wheel: peaceful -> loving",
+        family=["Happiness"],
+        soft=[("au", _SMILE), ("au", _CHEEK)],
+        hard=[("tilt", HEAD_TILT_DEG)],
+        min_frac=1.0,
+    ),
+    "Awe": dict(
+        wheel="Plutchik dyad fear + surprise (awe); feelings wheel: surprised -> amazed",
+        family=["Surprise", "Happiness", "Fear"],
+        soft=[("au", _BROW_UP), ("au", _WIDE), ("au", _SLIGHT_SMILE), ("au", _JAW),
+              ("chin_up", 6.0)],
+        hard=[],
+        min_frac=0.60,
+    ),
+    "Relieved": dict(
+        wheel="feelings wheel: peaceful -> relieved",
+        family=["Happiness", "Neutral"],
+        soft=[("au", _LIDS_DROOP), ("au", _SLIGHT_SMILE), ("au", [("jawOpen", 0.15)])],
+        # AU 18 is unique to relief among Cordaro's 22 — make it the gate.
+        hard=[("au", _PUCKER)],
+        min_frac=0.34,
+    ),
+    "Bored": dict(
+        wheel="Plutchik: disgust petal, low tier (boredom); feelings wheel: sad -> bored",
+        family=["Neutral", "Sadness", "Contempt", "Disgust"],
+        soft=[("au", _LIDS_DROOP), ("any", [("tilt", HEAD_TILT_DEG), ("chin_down", HEAD_PITCH_DEG)])],
+        hard=[("not", [("mouthSmileLeft", 0.20), ("mouthSmileRight", 0.20)]),
+              ("not", [("browInnerUp", 0.30)])],
+        min_frac=1.0,
+    ),
+    "Confused": dict(
+        wheel="feelings wheel: surprised -> confused; scared -> bewildered",
+        family=["Anger", "Neutral", "Sadness", "Disgust", "Fear"],
+        soft=[("au", _BROW_DOWN), ("au", _SQUINT)],
+        hard=[("tilt", HEAD_TILT_DEG), ("not", [("mouthSmileLeft", 0.20), ("mouthSmileRight", 0.20)])],
+        min_frac=0.50,
+    ),
+    "Embarrassed": dict(
+        wheel="feelings wheel: scared -> embarrassed; Plutchik tertiary dyad fear + disgust",
+        family=["Happiness", "Neutral", "Fear"],
+        soft=[("au", _SMILE), ("au", _DAMPENER), ("au", _SQUINT), _LOOK_AWAY],
+        hard=[("chin_down", HEAD_PITCH_DEG)],
+        min_frac=0.50,
+    ),
+    "Ashamed": dict(
+        wheel="feelings wheel: sad -> ashamed / guilty",
+        family=["Sadness", "Neutral", "Fear", "Disgust"],
+        soft=[("au", _BROW_DOWN), ("au", ["mouthShrugUpper"]), ("gaze", "down", GAZE_THRESHOLD)],
+        hard=[("chin_down", HEAD_PITCH_DEG), ("not", [("mouthSmileLeft", 0.20), ("mouthSmileRight", 0.20)])],
+        min_frac=0.34,
+    ),
+    "Sympathetic": dict(
+        wheel="feelings wheel: peaceful -> nurturing / caring",
+        family=["Sadness", "Neutral"],
+        soft=[("au", ["mouthShrugUpper"]), ("au", _PRESS), ("chin_down", HEAD_PITCH_DEG)],
+        # AU 1 (the "oblique brow") is the signature; without it a resting face passes.
+        hard=[("au", ["browInnerUp"]), ("not", [("mouthSmileLeft", 0.25), ("mouthSmileRight", 0.25)])],
+        min_frac=0.34,
+    ),
+    "Pain": dict(
+        wheel="feelings wheel: sad -> hurt",
+        family=["Disgust", "Anger", "Sadness", "Fear"],
+        soft=[("au", _BROW_DOWN), ("au", _CHEEK), ("au", _SQUINT), ("au", _NOSE),
+              ("au", _STRETCH), ("au", _LIDS_DROOP)],
+        hard=[],
+        min_frac=0.50,
+    ),
+    "Coy": dict(
+        wheel="feelings wheel: happy -> playful",
+        family=["Happiness"],
+        soft=[("au", _SMILE), ("au", _CHEEK), _LOOK_AWAY],
+        hard=[("chin_down", HEAD_PITCH_DEG)],
+        min_frac=0.67,
+    ),
+    "Anxious": dict(
+        wheel="Plutchik: fear petal, low tier (apprehension); feelings wheel: scared -> anxious",
+        family=["Fear", "Sadness", "Neutral"],
+        soft=[("au", ["browInnerUp"]), ("au", _BROW_DOWN), ("au", _STRETCH + _PRESS), _LOOK_AWAY],
+        hard=[("not", [("mouthSmileLeft", 0.20), ("mouthSmileRight", 0.20)])],
+        min_frac=0.50,
+    ),
+}
+
+WHEEL_TARGETS = list(WHEEL_SPECS)
+ALL_TARGETS = EMOTION_TARGETS + WHEEL_TARGETS
+
+# Keyboard keys for the pick menu / practice switching. 'b' (back) and 'q'
+# (quit) are deliberately absent.
+TARGET_KEYS = dict(zip("1234567" + "acdefghijklmnoprs", ALL_TARGETS))
+KEY_FOR_TARGET = {name: key for key, name in TARGET_KEYS.items()}
 
 
 # --- model + camera loading ----------------------------------------------
@@ -101,6 +289,7 @@ def load_models(task_path: str = FACE_LANDMARKER_TASK):
         mp_vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=task_path),
             output_face_blendshapes=True,
+            output_facial_transformation_matrixes=True,
             num_faces=1,
             running_mode=mp_vision.RunningMode.VIDEO,
         )
@@ -149,10 +338,42 @@ def blendshapes_to_dict(blendshapes_list) -> dict:
     return {b.category_name: float(b.score) for b in blendshapes_list}
 
 
+def head_pose_from_matrix(matrix) -> dict:
+    """Head angles in degrees from MediaPipe's facial transformation matrix.
+
+    The matrix maps the canonical face model into camera space (OpenGL-style:
+    +Y up, +Z toward the camera), so its columns are the face's local axes.
+      pitch  > 0 chin up (FACS 53), < 0 chin down (54)
+      roll   tilt ear-to-shoulder (55/56) — sign depends on side, use abs()
+      yaw    head turned (51/52) — sign depends on side, use abs()
+    """
+    rot = np.asarray(matrix, dtype=float)[:3, :3]
+    fwd, up = rot[:, 2], rot[:, 1]
+    clamp = lambda v: max(-1.0, min(1.0, float(v)))
+    return {
+        "pitch": math.degrees(math.asin(clamp(fwd[1]))),
+        "yaw": math.degrees(math.asin(clamp(fwd[0]))),
+        "roll": math.degrees(math.atan2(up[0], up[1])),
+    }
+
+
+def gaze_from_blendshapes(bs: dict) -> dict:
+    """Gaze direction 0..1 from the eyeLook* blendshapes (FACS 61-64)."""
+    avg = lambda a, b: (bs.get(a, 0.0) + bs.get(b, 0.0)) / 2
+    return {
+        "down": avg("eyeLookDownLeft", "eyeLookDownRight"),
+        "up": avg("eyeLookUpLeft", "eyeLookUpRight"),
+        # both eyes swinging the same way: one looks out while the other looks in
+        "averted": max(avg("eyeLookOutLeft", "eyeLookInRight"),
+                       avg("eyeLookInLeft", "eyeLookOutRight")),
+    }
+
+
 def analyze_frame(frame, recognizer, landmarker, ts_ms: int) -> dict | None:
     """Run both models on a BGR frame. Returns None if no face is detected.
 
-    Result dict has: bbox, class_probs, valence, arousal, blendshapes.
+    Result dict has: bbox, class_probs, valence, arousal, blendshapes,
+    head (pitch/yaw/roll degrees, or None), gaze (down/up/averted 0..1).
     """
     h, w = frame.shape[:2]
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -177,6 +398,9 @@ def analyze_frame(frame, recognizer, landmarker, ts_ms: int) -> dict | None:
     blendshapes = {}
     if lm_result.face_blendshapes:
         blendshapes = blendshapes_to_dict(lm_result.face_blendshapes[0])
+    head = None
+    if lm_result.facial_transformation_matrixes:
+        head = head_pose_from_matrix(lm_result.facial_transformation_matrixes[0])
 
     return {
         "bbox": (x0, y0, x1, y1),
@@ -184,6 +408,8 @@ def analyze_frame(frame, recognizer, landmarker, ts_ms: int) -> dict | None:
         "valence": valence,
         "arousal": arousal,
         "blendshapes": blendshapes,
+        "head": head,
+        "gaze": gaze_from_blendshapes(blendshapes),
     }
 
 
@@ -238,30 +464,111 @@ def compute_active_aus(bs: dict) -> list[tuple[str, float]]:
 
 
 # --- game match scoring ---------------------------------------------------
+def _split(item):
+    return item if isinstance(item, tuple) else (item, None)
+
+
+def _cue_ok(cue, analysis: dict, au_thr: float) -> bool:
+    kind = cue[0]
+    bs = analysis["blendshapes"]
+    head = analysis.get("head") or {}
+    gaze = analysis.get("gaze") or {}
+    if kind == "au":
+        return any(bs.get(n, 0.0) >= (t if t is not None else au_thr)
+                   for n, t in map(_split, cue[1]))
+    if kind == "not":
+        return all(bs.get(n, 0.0) < (t if t is not None else au_thr)
+                   for n, t in map(_split, cue[1]))
+    if kind == "tilt":
+        return abs(head.get("roll", 0.0)) >= cue[1]
+    if kind == "turn":
+        return abs(head.get("yaw", 0.0)) >= cue[1]
+    if kind == "chin_up":
+        return head.get("pitch", 0.0) >= cue[1]
+    if kind == "chin_down":
+        return head.get("pitch", 0.0) <= -cue[1]
+    if kind == "gaze":
+        return gaze.get(cue[1], 0.0) >= cue[2]
+    if kind == "asym":
+        left, right = cue[1]
+        return abs(bs.get(left, 0.0) - bs.get(right, 0.0)) >= cue[2]
+    if kind == "any":
+        return any(_cue_ok(c, analysis, au_thr) for c in cue[1])
+    raise ValueError(f"unknown cue kind {kind!r}")
+
+
+def target_spec(target: str) -> dict:
+    """Unified cue spec for a core class or a wheel target."""
+    if target in WHEEL_SPECS:
+        return WHEEL_SPECS[target]
+    spec = {
+        "family": [target],
+        "soft": [("au", group) for group in TARGET_BLENDSHAPES.get(target, [])],
+        "hard": [],
+    }
+    # Contempt: require asymmetry in dimplers or smile corners.
+    if target == "Contempt":
+        spec["hard"] = [("any", [("asym", ("mouthDimpleLeft", "mouthDimpleRight"), 0.15),
+                                 ("asym", ("mouthSmileLeft", "mouthSmileRight"), 0.15)])]
+    return spec
+
+
+def match_score(
+    target: str,
+    analysis: dict,
+    class_prob_threshold: float,
+    au_fraction_threshold: float,
+    au_active_threshold: float = AU_DISPLAY_THRESHOLD,
+) -> tuple[bool, float, float, float]:
+    """Score one target. Returns (is_match, family_prob, cue_frac, visual).
+
+    family_prob — best classifier probability among the target's HSE family
+    cue_frac    — fraction of all cues (soft + hard) currently satisfied
+    visual      — 0..1 progress for the match bar (half class, half cues)
+    """
+    spec = target_spec(target)
+    probs = analysis["class_probs"]
+    p = max((probs.get(f, 0.0) for f in spec["family"]), default=1.0)
+
+    soft_ok = [_cue_ok(c, analysis, au_active_threshold) for c in spec["soft"]]
+    hard_ok = [_cue_ok(c, analysis, au_active_threshold) for c in spec["hard"]]
+    n_cues = len(soft_ok) + len(hard_ok)
+    frac = (sum(soft_ok) + sum(hard_ok)) / n_cues if n_cues else 1.0
+    soft_frac = sum(soft_ok) / len(soft_ok) if soft_ok else 1.0
+    min_frac = spec.get("min_frac", au_fraction_threshold)
+
+    is_match = p >= class_prob_threshold and all(hard_ok) and soft_frac >= min_frac
+    visual = min(1.0, 0.5 * min(p / class_prob_threshold, 1.0) + 0.5 * frac)
+    return is_match, p, frac, visual
+
+
 def target_match(
     target: str,
-    class_probs: dict,
-    bs: dict,
+    analysis: dict,
     class_prob_threshold: float,
     au_fraction_threshold: float,
     au_active_threshold: float = AU_DISPLAY_THRESHOLD,
 ) -> tuple[bool, float, float]:
-    """Return (is_match, class_prob, au_fraction) for the given target emotion."""
-    p = class_probs.get(target, 0.0)
-    groups = TARGET_BLENDSHAPES.get(target, [])
-    active = sum(
-        1 for g in groups if any(bs.get(n, 0.0) >= au_active_threshold for n in g)
+    """Return (is_match, family_prob, cue_fraction) for the given target."""
+    is_match, p, frac, _ = match_score(
+        target, analysis, class_prob_threshold, au_fraction_threshold, au_active_threshold
     )
-    frac = active / len(groups) if groups else 1.0
-
-    # Contempt: require asymmetry in dimplers or smile corners.
-    if target == "Contempt":
-        asym = max(
-            abs(bs.get("mouthDimpleLeft", 0.0) - bs.get("mouthDimpleRight", 0.0)),
-            abs(bs.get("mouthSmileLeft", 0.0) - bs.get("mouthSmileRight", 0.0)),
-        )
-        if asym < 0.15:
-            frac = 0.0
-
-    is_match = (p >= class_prob_threshold) and (frac >= au_fraction_threshold)
     return is_match, p, frac
+
+
+def best_wheel_match(
+    analysis: dict,
+    class_prob_threshold: float,
+    au_fraction_threshold: float,
+    targets: list[str] = ALL_TARGETS,
+) -> tuple[str | None, float, bool]:
+    """Closest target by match progress. Returns (name, visual, is_match)."""
+    best = (None, 0.0, False)
+    for name in targets:
+        is_match, _, _, visual = match_score(
+            name, analysis, class_prob_threshold, au_fraction_threshold
+        )
+        # Prefer true matches; among equals, the higher visual score.
+        if (is_match, visual) > (best[2], best[1]):
+            best = (name, visual, is_match)
+    return best

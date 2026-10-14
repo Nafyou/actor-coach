@@ -36,12 +36,17 @@ The main menu entries are in the `MAIN_MENU` list. Each row is
 
 ```python
 MAIN_MENU = [
-    ("1", "Classic Simon",             "Random prompt. 5s to hit. One miss = game over."),
-    ("2", "Practice a single emotion", "Pick one. Drill it until you quit."),
-    ("3", "Freeplay / Mirror",         "Just show what the model sees on you."),
+    ("1", "Classic Simon",             "Random prompt from the 7 core emotions. ..."),
+    ("2", "Practice a single emotion", "Pick any of the 23. Drill it until you quit."),
+    ("3", "Freeplay / Mirror",         "Live classes, AUs, head pose, and closest wheel emotion."),
+    ("4", "Wheel Simon",               "Classic rules, all 23 emotions. Head pose counts. Hard."),
     ("q", "Quit",                      ""),
 ]
 ```
+
+The emotion pick screen (`draw_pick_menu`) lays `ALL_TARGETS` out in two
+columns and labels each with its key from `KEY_FOR_TARGET`. Keys are assigned
+in `emotion_lib.TARGET_KEYS` (`1`-`7` core, then `a`-`s` skipping `b`/`q`).
 
 To add a new mode: add a row here, add a new `S_*` state constant, handle it
 in the main `if app["mode"] == ...` chain, and add a key branch in the
@@ -52,9 +57,10 @@ there. It's ~15 lines.
 
 ## 3. Per-emotion hints
 
-`TARGET_HINTS` is defined in [`emotion_lib.py`](emotion_lib.py). Edit the
-text there to change what shows up under the prompt ("brows up, eyes wide,
-jaw drop", etc.). Keep them short — they render on one line.
+`TARGET_HINTS` is defined in [`emotion_lib.py`](emotion_lib.py) for all 23
+targets. Edit the text there to change what shows up under the prompt ("brows
+up, eyes wide, jaw drop", etc.). Keep them short — they render on one line,
+and on the pick screen they're truncated by the column width.
 
 ## 4. Game difficulty knobs
 
@@ -71,6 +77,21 @@ FLASH_DURATION = 1.0           # how long the +1 / missed banner lingers
 
 Raise `CLASS_PROB_THRESHOLD` or `AU_FRACTION_THRESHOLD` for a harder game.
 Lower them when building a demo where you want generous scoring.
+
+Wheel targets have their own `min_frac` inside `WHEEL_SPECS` (how many of the
+recipe's soft cues must be present), and the head-pose cues read these
+constants in `emotion_lib.py`:
+
+```python
+HEAD_TILT_DEG = 8.0      # ear toward shoulder
+HEAD_PITCH_DEG = 8.0     # chin up / chin down
+HEAD_TURN_DEG = 10.0     # head turned
+GAZE_THRESHOLD = 0.30    # eyeLook* level that counts as a gaze shift
+```
+
+If your camera sits off-axis (laptop on a desk, you looking down at it) the
+freeplay head readout will show a resting chin-down of several degrees. Raise
+`HEAD_PITCH_DEG` or tilt the camera up to compensate.
 
 ## 5. Per-emotion difficulty (advanced)
 
@@ -107,6 +128,10 @@ Three draw functions control the mirror mode:
     considered "active".
   - `active[:8]` in `compute_active_aus` caps the list; raise/lower it to
     show more or fewer.
+- `draw_head_and_wheel` — head pose (chin/tilt/turn in degrees), gaze, and
+  the closest of the 23 targets with its match %, top-center. Goes green
+  with `MATCH` when that target would score in game mode. Pass a `targets=`
+  subset to `best_wheel_match` if you only want the wheel emotions ranked.
 
 ## 7. Prompt HUD (Classic + Practice)
 
@@ -140,25 +165,55 @@ training asymmetry awareness).
 
 ## 10. Adding a new emotion
 
-The model outputs a fixed 8 classes — you can't *add* an emotion to
-detection. But you can:
+The classifier outputs a fixed 8 classes — you can't add a class to
+detection. Wheel emotions are instead **recipes** in `emotion_lib.WHEEL_SPECS`,
+scored from blendshapes, head pose, and gaze, with the classifier used only as
+a valence gate. To add one, append an entry:
 
-- Add a **derived label** by combining existing classes. Example: define
-  "frustrated" as Anger ≥ 0.3 AND Disgust ≥ 0.2. Add a branch in `describe`
-  that checks this combo before falling back to `intensity_label`.
-- Add a new **target phrase** for practice mode. Drop an entry into
-  `TARGET_BLENDSHAPES` with the AU recipe and `TARGET_HINTS` with the copy.
-  The target dropdown will pick it up via `EMOTION_TARGETS` — just add the
-  name to that list too.
+```python
+"Skeptical": dict(
+    wheel="where it sits on the wheel (for the guide)",
+    family=["Neutral", "Contempt"],          # any of these must clear CLASS_PROB_THRESHOLD
+    soft=[("au", ["mouthPressLeft", "mouthPressRight"]),
+          ("au", ["eyeSquintLeft", "eyeSquintRight"])],
+    hard=[("asym", ("browOuterUpLeft", "browOuterUpRight"), 0.20)],  # one brow up
+    min_frac=0.5,                            # fraction of soft cues required
+),
+```
+
+Cue vocabulary (see the comment above `WHEEL_SPECS`):
+
+| Cue | Passes when |
+|---|---|
+| `("au", [names])` | any listed blendshape ≥ `AU_DISPLAY_THRESHOLD`; `(name, thr)` overrides the threshold per blendshape |
+| `("not", [names])` | all listed blendshapes below threshold |
+| `("tilt", deg)` / `("turn", deg)` | head roll / yaw magnitude ≥ deg |
+| `("chin_up", deg)` / `("chin_down", deg)` | head pitch ≥ deg / ≤ −deg |
+| `("gaze", "down" \| "up" \| "averted", thr)` | eyeLook* level ≥ thr |
+| `("asym", (left, right), thr)` | left/right blendshape difference ≥ thr |
+| `("any", [cues])` | at least one sub-cue passes |
+
+`hard` cues must all pass; `soft` cues must reach `min_frac`. Then add a
+line to `TARGET_HINTS`, and it appears on the pick screen, in Practice, in
+Wheel Simon, and in the freeplay "closest" readout automatically (keys come
+from `TARGET_KEYS` — extend the key string there if you run out). Document the
+AU recipe and its source in `guides.md`.
+
+For a **derived label** in freeplay (e.g. "frustrated" = Anger ≥ 0.3 AND
+Disgust ≥ 0.2), add a branch in `describe` before it falls back to
+`intensity_label`, or add the pair to `DYADS`.
 
 ## 11. Where inference lives
 
 You probably don't need to touch this, but for completeness:
 
 - `emotion_lib.analyze_frame` runs both models and returns a dict with
-  `bbox`, `class_probs`, `valence`, `arousal`, `blendshapes`.
+  `bbox`, `class_probs`, `valence`, `arousal`, `blendshapes`, `head`
+  (`pitch`/`yaw`/`roll` in degrees, from MediaPipe's facial transformation
+  matrix) and `gaze` (`down`/`up`/`averted`, 0..1).
 - `emotion_lib.compute_active_aus` turns blendshapes into active AUs.
-- `emotion_lib.target_match` does the game's scoring logic.
+- `emotion_lib.match_score` does the game's scoring logic for any target
+  (core or wheel); `best_wheel_match` ranks all targets for freeplay.
 
 To swap the emotion model (e.g. `enet_b2_8` for higher accuracy, slower),
 edit the `HSEmotionRecognizer(model_name=...)` call in `emotion_lib.load_models`.

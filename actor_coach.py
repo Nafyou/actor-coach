@@ -1,14 +1,17 @@
 """Actor Coach — real-time facial-emotion practice with multiple modes.
 
 Modes:
-  1. Classic Simon   — random prompt, 5s to hit it, one miss ends the game
-  2. Practice        — pick one emotion, drill it endlessly, rack up hits
-  3. Freeplay        — mirror with live emotion bars, valence/arousal, and AUs
+  1. Classic Simon   — random prompt from the 7 core emotions, 5s to hit it,
+                       one miss ends the game
+  2. Practice        — pick any of the 23 emotions, drill it endlessly
+  3. Freeplay        — mirror with live emotion bars, valence/arousal, AUs,
+                       head pose, and the closest wheel emotion
+  4. Wheel Simon     — classic rules, but prompts come from the full wheel
 
 Run:  .venv/bin/python actor_coach.py 1          # camera index 1 (default 0)
       .venv/bin/python actor_coach.py --list     # probe indices 0..5
 Quit:     q from the menu
-Back:     Esc from any sub-mode
+Back:     b from any sub-mode
 """
 import random
 import sys
@@ -17,16 +20,19 @@ import time
 import cv2
 
 from emotion_lib import (
-    ALL_EMOTIONS,
+    ALL_TARGETS,
     EMOTION_TARGETS,
+    KEY_FOR_TARGET,
     TARGET_HINTS,
+    TARGET_KEYS,
     analyze_frame,
+    best_wheel_match,
     compute_active_aus,
     describe,
     load_models,
+    match_score,
     open_camera,
     probe_cameras,
-    target_match,
 )
 
 # --- game-mode tuning -----------------------------------------------------
@@ -53,9 +59,10 @@ BOX = (0, 255, 0)
 
 # --- menu labels ----------------------------------------------------------
 MAIN_MENU = [
-    ("1", "Classic Simon",       "Random prompt. 5s to hit. One miss = game over."),
-    ("2", "Practice a single emotion", "Pick one. Drill it until you quit."),
-    ("3", "Freeplay / Mirror",   "Just show what the model sees on you."),
+    ("1", "Classic Simon",       "Random prompt from the 7 core emotions. 5s to hit. One miss = game over."),
+    ("2", "Practice a single emotion", "Pick any of the 23. Drill it until you quit."),
+    ("3", "Freeplay / Mirror",   "Live classes, AUs, head pose, and closest wheel emotion."),
+    ("4", "Wheel Simon",         "Classic rules, all 23 emotions. Head pose counts. Hard."),
     ("q", "Quit",                ""),
 ]
 
@@ -107,21 +114,27 @@ def draw_main_menu(frame):
 
 def draw_pick_menu(frame):
     draw_dim(frame, 0.62)
-    h = frame.shape[0]
-    put_centered(frame, "Practice which emotion?", 80, 1.1, TEXT, 2)
-    put_centered(frame, "press a number, Esc to go back", 115, 0.5, MUTED, 1)
+    h, w = frame.shape[:2]
+    put_centered(frame, "Practice which emotion?", 60, 1.0, TEXT, 2)
+    put_centered(frame, "press its key, [b] to go back", 90, 0.5, MUTED, 1)
 
-    base_y = 170
-    for i, emotion in enumerate(EMOTION_TARGETS):
-        y = base_y + i * 44
-        cv2.putText(frame, f"[{i+1}]", (120, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, ACCENT, 2, cv2.LINE_AA)
-        cv2.putText(frame, emotion, (190, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, TEXT, 2, cv2.LINE_AA)
+    # Two columns: core 7 first, then the wheel. Row pitch shrinks on small frames.
+    per_col = (len(ALL_TARGETS) + 1) // 2
+    row_h = max(22, min(34, (h - 150) // per_col))
+    col_w = w // 2
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for i, emotion in enumerate(ALL_TARGETS):
+        col, row = divmod(i, per_col)
+        x = 30 + col * col_w
+        y = 130 + row * row_h
+        color = TEXT if emotion in EMOTION_TARGETS else ACCENT
+        cv2.putText(frame, f"[{KEY_FOR_TARGET[emotion]}]", (x, y), font, 0.6, ACCENT, 2, cv2.LINE_AA)
+        cv2.putText(frame, emotion, (x + 42, y), font, 0.6, color, 2, cv2.LINE_AA)
         hint = TARGET_HINTS.get(emotion, "")
         if hint:
-            cv2.putText(frame, hint, (360, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, MUTED, 1, cv2.LINE_AA)
+            cv2.putText(frame, hint, (x + 180, y), font, 0.4, MUTED, 1, cv2.LINE_AA)
+    cv2.putText(frame, "white = classifier core   cyan = wheel (AU recipe + head pose)",
+                (30, h - 14), font, 0.42, MUTED, 1, cv2.LINE_AA)
 
 
 # --- classic + practice shared prompt HUD --------------------------------
@@ -155,7 +168,7 @@ def draw_prompt_hud(frame, target, time_left, score, match_frac, label_prefix="S
         cv2.putText(frame, "match", (mx, my - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, TEXT, 1, cv2.LINE_AA)
 
-    cv2.putText(frame, "[Esc] back", (10, h - 10),
+    cv2.putText(frame, "[b] back", (10, h - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, MUTED, 1, cv2.LINE_AA)
 
 
@@ -165,7 +178,7 @@ def draw_ready(frame, seconds_left, score):
     put_centered(frame, f"next in {seconds_left:0.1f}s", 110, 0.55, ACCENT, 1)
     cv2.putText(frame, f"Score: {score}", (frame.shape[1] - 170, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, TEXT, 2, cv2.LINE_AA)
-    cv2.putText(frame, "[Esc] back", (10, frame.shape[0] - 10),
+    cv2.putText(frame, "[b] back", (10, frame.shape[0] - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, MUTED, 1, cv2.LINE_AA)
 
 
@@ -181,7 +194,7 @@ def draw_game_over(frame, score):
     h = frame.shape[0]
     put_centered(frame, "GAME OVER", h // 2 - 60, 1.9, RED, 4)
     put_centered(frame, f"Final score: {score}", h // 2, 1.2, TEXT, 2)
-    put_centered(frame, "[r] restart   [Esc] menu   [q] quit", h // 2 + 60, 0.65, ACCENT, 1)
+    put_centered(frame, "[r] restart   [b] menu   [q] quit", h // 2 + 60, 0.65, ACCENT, 1)
 
 
 # --- freeplay drawing (mirror view) --------------------------------------
@@ -243,9 +256,32 @@ def draw_freeplay(frame, analysis):
     draw_bars(frame, analysis["class_probs"])
     draw_circumplex(frame, analysis["valence"], analysis["arousal"])
     draw_aus(frame, compute_active_aus(analysis["blendshapes"]))
-    cv2.putText(frame, "[Esc] back   [q] quit",
+    draw_head_and_wheel(frame, analysis)
+    cv2.putText(frame, "[b] back   [q] quit",
                 (10, frame.shape[0] - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, MUTED, 1, cv2.LINE_AA)
+
+
+def draw_head_and_wheel(frame, analysis, origin=(190, 30)):
+    """Head pose + gaze readout and the closest wheel emotion (freeplay)."""
+    x0, y0 = origin
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    head = analysis.get("head")
+    if head:
+        pitch, roll, yaw = head["pitch"], head["roll"], head["yaw"]
+        chin = "up" if pitch > 0 else "down"
+        txt = f"head  chin {chin} {abs(pitch):4.1f}  tilt {abs(roll):4.1f}  turn {abs(yaw):4.1f}"
+        cv2.putText(frame, txt, (x0, y0), font, 0.42, AU_COLOR, 1, cv2.LINE_AA)
+    gaze = analysis.get("gaze") or {}
+    cv2.putText(frame, f"gaze  down {gaze.get('down', 0):.2f}  up {gaze.get('up', 0):.2f}"
+                f"  averted {gaze.get('averted', 0):.2f}",
+                (x0, y0 + 18), font, 0.42, AU_COLOR, 1, cv2.LINE_AA)
+    name, visual, is_match = best_wheel_match(
+        analysis, CLASS_PROB_THRESHOLD, AU_FRACTION_THRESHOLD)
+    if name:
+        color = GREEN if is_match else MUTED
+        cv2.putText(frame, f"closest: {name} {visual * 100:.0f}%" + ("  MATCH" if is_match else ""),
+                    (x0, y0 + 40), font, 0.55, color, 2, cv2.LINE_AA)
 
 
 def draw_no_face_warning(frame):
@@ -257,18 +293,8 @@ def draw_no_face_warning(frame):
 # --- match-scoring glue used by classic + practice -----------------------
 def match_progress(target, analysis):
     """Return (is_match, visual_match_frac 0..1) for the given target."""
-    is_match, p, frac = target_match(
-        target,
-        analysis["class_probs"],
-        analysis["blendshapes"],
-        CLASS_PROB_THRESHOLD,
-        AU_FRACTION_THRESHOLD,
-    )
-    visual = min(
-        1.0,
-        0.5 * min(p / CLASS_PROB_THRESHOLD, 1.0)
-        + 0.5 * min(frac / AU_FRACTION_THRESHOLD, 1.0),
-    )
+    is_match, _, _, visual = match_score(
+        target, analysis, CLASS_PROB_THRESHOLD, AU_FRACTION_THRESHOLD)
     return is_match, visual
 
 
@@ -292,6 +318,7 @@ app = {
     "classic_phase_start": time.time(),
     "classic_score": 0,
     "classic_target": None,
+    "classic_pool": EMOTION_TARGETS,   # or ALL_TARGETS for Wheel Simon
     "classic_round_start": None,
     "classic_hold_start": None,
     "classic_flash_text": "",
@@ -324,8 +351,9 @@ while True:
         draw_main_menu(frame)
         if key == ord("q"):
             break
-        if key == ord("1"):
+        if key in (ord("1"), ord("4")):
             app["mode"] = S_CLASSIC
+            app["classic_pool"] = EMOTION_TARGETS if key == ord("1") else ALL_TARGETS
             app["classic_phase"] = "ready"
             app["classic_phase_start"] = now
             app["classic_score"] = 0
@@ -339,27 +367,25 @@ while True:
     # ---- PICK EMOTION --------------------------------------------------
     elif app["mode"] == S_PICK:
         draw_pick_menu(frame)
-        if key == 27:  # Esc
+        if key == ord("b"):
             app["mode"] = S_MENU
-        elif ord("1") <= key <= ord("9"):
-            idx = key - ord("1")
-            if 0 <= idx < len(EMOTION_TARGETS):
-                app["practice_target"] = EMOTION_TARGETS[idx]
-                app["practice_score"] = 0
-                app["practice_hold_start"] = None
-                app["practice_flash_start"] = 0.0
-                app["mode"] = S_PRACTICE
+        elif chr(key) in TARGET_KEYS:
+            app["practice_target"] = TARGET_KEYS[chr(key)]
+            app["practice_score"] = 0
+            app["practice_hold_start"] = None
+            app["practice_flash_start"] = 0.0
+            app["mode"] = S_PRACTICE
 
     # ---- CLASSIC SIMON -------------------------------------------------
     elif app["mode"] == S_CLASSIC:
-        if key == 27:  # Esc -> menu
+        if key == ord("b"):  # back -> menu
             app["mode"] = S_MENU
             continue
         if app["classic_phase"] == "ready":
             elapsed = now - app["classic_phase_start"]
             draw_ready(frame, max(0.0, READY_DURATION - elapsed), app["classic_score"])
             if elapsed >= READY_DURATION:
-                app["classic_target"] = random.choice(EMOTION_TARGETS)
+                app["classic_target"] = random.choice(app["classic_pool"])
                 app["classic_phase"] = "playing"
                 app["classic_round_start"] = now
                 app["classic_hold_start"] = None
@@ -416,9 +442,13 @@ while True:
 
     # ---- PRACTICE ------------------------------------------------------
     elif app["mode"] == S_PRACTICE:
-        if key == 27:
+        if key == ord("b"):
             app["mode"] = S_MENU
             continue
+        if chr(key) in TARGET_KEYS:
+            app["practice_target"] = TARGET_KEYS[chr(key)]
+            app["practice_hold_start"] = None
+            app["practice_flash_start"] = 0.0
         target = app["practice_target"]
         match_frac = 0.0
         if analysis is not None:
@@ -438,13 +468,16 @@ while True:
 
         draw_prompt_hud(frame, target, None, app["practice_score"], match_frac,
                         label_prefix="PRACTICE")
+        cv2.putText(frame, "[1-7, a-s] switch emotion",
+                    (120, frame.shape[0] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, MUTED, 1, cv2.LINE_AA)
         if now - app["practice_flash_start"] < 0.6:
             put_centered(frame, app["practice_flash_text"],
                          frame.shape[0] // 2, 1.5, GREEN, 3)
 
     # ---- FREEPLAY ------------------------------------------------------
     elif app["mode"] == S_FREEPLAY:
-        if key == 27:
+        if key == ord("b"):
             app["mode"] = S_MENU
             continue
         if key == ord("q"):

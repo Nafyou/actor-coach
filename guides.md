@@ -7,7 +7,7 @@ an approach to *produce* the feeling so the face does the right thing honestly.
 ## How to use this with the Actor Coach
 
 ```
-cd /Users/sahil/Coding/faceemotion2013 && .venv/bin/python actor_coach.py 1
+./run.sh
 ```
 
 Pick **Freeplay** (option 3) from the menu — that's the mirror view these
@@ -15,6 +15,9 @@ guides are written for. What you'll see overlaid on the preview:
 - **Top label on the face** — nuanced emotion word (intensity tier)
 - **Second line** — raw class + % (or a Plutchik dyad name like *awe*, *remorse*)
 - **Top-left bars** — all 8 class probabilities from HSEmotion
+- **Top-center** — head pose (chin up/down, tilt, turn in degrees), gaze, and
+  the **closest of the 23 targets** with its match %. Green `MATCH` means it
+  would score in game mode.
 - **Top-right circle** — Russell circumplex: valence (pleasant↔unpleasant) × arousal (calm↔excited)
 - **Bottom-left AU panel** — active Action Units derived from MediaPipe
   blendshapes. Match these numbers to the AU recipes below.
@@ -32,6 +35,11 @@ guides are written for. What you'll see overlaid on the preview:
 - [Disgust](#disgust) — disinterested → disgusted → loathing
 - [Contempt](#contempt) — dismissive → contemptuous → disdainful
 - [Neutral](#neutral) — stillness as an active state
+- [The emotion wheel](#the-emotion-wheel) — where the 23 targets sit on Plutchik's wheel and the feelings wheel
+  - [Curious](#curious) · [Excited](#excited) · [Amused](#amused) · [Content](#content)
+    · [Proud](#proud) · [Loving](#loving) · [Awe](#awe) · [Relieved](#relieved)
+  - [Bored](#bored) · [Confused](#confused) · [Embarrassed](#embarrassed) · [Ashamed](#ashamed)
+    · [Sympathetic](#sympathetic) · [Pain](#pain) · [Coy](#coy) · [Anxious](#anxious)
 - [Blendshape → AU mapping reference](#blendshape--au-mapping-reference)
 
 ---
@@ -810,6 +818,469 @@ rather than committed to an emotion you don't mean.
 
 ---
 
+## The emotion wheel
+
+The classifier only knows eight classes. Everything else on an emotion wheel
+is scored a different way: a **FACS recipe** (blendshape groups), plus **head
+pose** and **gaze** from MediaPipe, with the classifier used only as a
+valence gate (a "curious" face must not read as angry or disgusted). The
+recipes are taken from three production studies in which people were asked to
+*show* an emotion and coders recorded which action units appeared across
+cultures:
+
+- **Cordaro, Sun, Keltner, Kamble, Huddar & McNeil (2018)**, *Universals and
+  cultural variations in 22 emotional expressions across five cultures*,
+  Emotion 18(1):75–93 — the "international core sequence" per emotion
+  (China, India, Japan, Korea, US).
+- **Keltner, Sauter, Tracy & Cowen (2019)**, *Emotional expression: Advances
+  in basic emotion theory*, J. Nonverbal Behavior 43:133–160 — Table 2,
+  prototypical AU patterns for the same 22.
+- **Shiota, Campos & Keltner (2003)**, *The faces of positive emotion*, Ann.
+  NY Acad. Sci. 1000:296–299 — amusement, awe, pride, and other positives.
+
+Head codes used below are FACS: **51/52** head turn, **53** chin up, **54**
+chin down, **55/56** head tilt, **57** head forward, **61–64** eyes
+left/right/up/down, **85** head nod. The coach reads tilt / chin / turn from
+MediaPipe's head-pose matrix and gaze from the `eyeLook*` blendshapes.
+Thresholds live in `emotion_lib.py` (`HEAD_TILT_DEG`, `HEAD_PITCH_DEG`,
+`HEAD_TURN_DEG`, `GAZE_THRESHOLD`).
+
+### Plutchik's wheel → coach targets
+
+Eight petals, three intensities each, and the "primary dyads" between
+neighbouring petals.
+
+| Petal | low → mid → high | Coach target(s) |
+|---|---|---|
+| Joy | serenity → joy → ecstasy | **Content** · Happiness tiers (*serene / happy / ecstatic*) · **Amused** |
+| Trust | acceptance → trust → admiration | **Loving** (joy+trust dyad); admiration ≈ **Awe** with a smile |
+| Fear | apprehension → fear → terror | **Anxious** · Fear tiers |
+| Surprise | distraction → surprise → amazement | Surprise tiers · **Awe** · **Excited** |
+| Sadness | pensiveness → sadness → grief | Sadness tiers · **Sympathetic** (other-directed sadness) |
+| Disgust | boredom → disgust → loathing | **Bored** · Disgust tiers |
+| Anger | annoyance → anger → rage | Anger tiers · **Confused** shares the AU 4+7 brow |
+| Anticipation | interest → anticipation → vigilance | **Curious** · **Excited** |
+
+| Primary dyad | = | Coach |
+|---|---|---|
+| love | joy + trust | **Loving** |
+| submission | trust + fear | — (no stable facial signature in the literature) |
+| awe | fear + surprise | **Awe** (also a freeplay dyad label) |
+| disapproval | surprise + sadness | freeplay dyad label only |
+| remorse | sadness + disgust | freeplay dyad label only; see **Ashamed** |
+| contempt | disgust + anger | **Contempt** |
+| aggressiveness | anger + anticipation | — (reads as Anger on camera) |
+| optimism | anticipation + joy | nearest is **Excited** |
+
+### Feelings wheel (Willcox) → coach targets
+
+The therapist's wheel — six cores, two rings of finer words. Where a word has
+a documented face, it's a target; where it doesn't, practise the nearest one.
+
+| Core | Ring words with a target | Nearest target for the rest |
+|---|---|---|
+| Joyful / Happy | amused → **Amused**, excited → **Excited**, playful → **Coy** / **Amused**, proud → **Proud**, hopeful → **Curious** | cheerful, delighted → Happiness |
+| Powerful | proud, confident → **Proud** | important, respected → **Proud** with less smile |
+| Peaceful | content, relaxed → **Content**, loving, intimate → **Loving**, nurturing, thankful → **Sympathetic**, relieved → **Relieved** | thoughtful, pensive → Sadness (low tier) |
+| Sad | bored → **Bored**, ashamed, guilty → **Ashamed**, hurt → **Pain**, lonely, depressed → Sadness | remorseful → Sadness + **Ashamed** |
+| Scared / Fearful | anxious, insecure → **Anxious**, embarrassed → **Embarrassed**, confused, bewildered → **Confused** | helpless, rejected → Fear / Sadness |
+| Mad / Angry | frustrated, irritated → Anger (low tier), critical → **Contempt** | hateful, hostile → Anger + Disgust |
+| Surprised | amazed → **Awe**, confused → **Confused**, excited → **Excited** | startled → Surprise |
+
+Two wheel words are deliberately **not** targets: *desire* (its core cue is a
+tongue show, AU 19, which blendshapes don't carry) and *triumph* (its
+signature is a fist in the air — body, not face).
+
+---
+
+### Curious
+
+Interest — Plutchik's *anticipation* petal at low intensity, and the
+"hopeful / fascinated / inquisitive" corner of the feelings wheel. The
+listening face.
+
+**Facial signal (FACS).** Keltner et al. 2019: **AU 1 + 2 + 12** — eyebrows
+raised, slight smile. Cordaro 2018's cross-cultural core was a **head nod
+(85)**, the least complex sequence of all 22. A head tilt is the acting
+convention for "I'm taking this in" and stands in here for the nod, which
+can't be read from a single frame. Not: wide eyes (AU 5) or a dropped jaw
+(26) — those turn it into Surprise.
+
+**What the coach checks.** Soft (2 of 3): brows up · hint of a smile
+(`mouthSmile` ≥ 0.12) · head tilt ≥ 8°. Hard: jaw mostly closed, eyes not
+wide. Family: Neutral / Happiness / Surprise.
+
+**Method.** *Action route* works best: play "to find out". Put a real
+question in your head about the thing in front of you — what's behind it,
+how does it work — and let the brows lift on the inhale of the question.
+*Body route:* lean an inch forward, let the head drift off-axis.
+
+**Verify.** Closest: **Curious**. AU panel: AU 1/2 with a small AU 12 and no
+AU 5. Head line: tilt ≥ 8°. Classes: neutral or mild happiness dominant.
+
+---
+
+### Excited
+
+High-arousal joy with a surprise edge — Plutchik's *delight* dyad (joy +
+surprise), the feelings wheel's *excited / energetic / eager*.
+
+**Facial signal (FACS).** A union of the Happiness and Surprise prototypes:
+**AU 6 + 12** (Duchenne smile) with **AU 1 + 2 + 5 + 26** (brows up, upper
+lids raised, jaw dropped). Cordaro's closest coded emotion is *triumph*
+(6+7+12+25+Jaw + fists raised); we drop the fists.
+
+**What the coach checks.** Soft (3 of 4): brows up · eyes wide · smile ·
+jaw open. Family: Happiness / Surprise.
+
+**Method.** *Memory route:* the moment of good news — the inhale before you
+say "no way". *Body route:* bounce on the balls of the feet; excitement lives
+in the breath catching high in the chest.
+
+**Verify.** Classes: happiness + surprise both lit (the freeplay dyad label
+*delight* appears). Circumplex: far top-right. AU panel: AU 5 and AU 12
+together — that pairing is the tell.
+
+---
+
+### Amused
+
+Laughter — the feelings wheel's *amused / playful*. Distinct from plain
+Happiness by the open jaw and the head going back.
+
+**Facial signal (FACS).** Keltner 2019: **AU 6 + 7 + 12 + 25 + 26 + 53** —
+head back, Duchenne smile, lips separated, jaw dropped. Cordaro 2018 core:
+6+7+12+16+25+Jaw+53. Shiota 2003 found the drop-jaw Duchenne pattern in 68%
+of posed amusement and a **head bounce** in nearly half.
+
+**What the coach checks.** Hard: jaw open ≥ 0.20. Soft (2 of 3): cheeks up
+(AU 6) · smile · chin up ≥ 8°. Family: Happiness.
+
+**Method.** The *laugh-back-in* exercise from Happiness — fake "ha ha ha"
+on the breath for 20 s past awkward. Let the head fall back on the big
+exhale; that's AU 53 arriving on its own.
+
+**Verify.** Closest: **Amused** (not Happiness — if the jaw is closed it
+scores as Happiness). Head line: chin up. AU panel: AU 6 + 12 + 26.
+
+---
+
+### Content
+
+Serenity — Plutchik's low-intensity joy; the feelings wheel's *content /
+relaxed / peaceful*. The one positive emotion with heavy eyelids.
+
+**Facial signal (FACS).** Keltner 2019: **AU 12 + 43** — smile, eyelids
+drooping. Cordaro 2018 core: **12 + 43 + deep breath** — participants
+breathed in, held, and released before relaxing. Closed mouth; no AU 6
+needed.
+
+**What the coach checks.** Soft (both): slight smile (≥ 0.12) · lids
+partially lowered (`eyeBlink` ≥ 0.20, i.e. half-closed, not shut). Hard:
+jaw closed. Family: Happiness / Neutral.
+
+**Method.** *Body route* is the whole thing: one slow 4-in / 6-out breath,
+let the lids drop on the exhale, let the mouth corners lift *after* the
+breath, not before. Chekhov's atmosphere: warm bath.
+
+**Verify.** Closest: **Content**. AU panel: AU 12 small, AU 43 partial, no
+AU 26. Circumplex: right side, low arousal. The classifier will often say
+*serene* or *neutral* — that's fine, the gate accepts both.
+
+---
+
+### Proud
+
+The feelings wheel's *powerful → proud / confident*. Pride is the emotion of
+posture: the face is subtle, the head isn't.
+
+**Facial signal (FACS).** Shiota 2003: **small Duchenne smile with
+compressed lips (AU 6 + 12 + 24)**, head lift in 38%, back straightening and
+chest exposed in about half. Keltner 2019: **53 + 64** — head up, eyes down.
+Tracy & Robins 2004 established the expanded posture + slight smile + head
+tilt back as the recognisable pride display.
+
+**What the coach checks.** Hard: chin up ≥ 8°. Soft (2 of 3): slight smile
+· lips pressed (AU 23/24) · cheeks up. Family: Happiness / Neutral.
+
+**Method.** *Body route:* lengthen the back of the neck, let the chin float
+up as the chest opens; press the lips as if holding back a bigger smile.
+*Action route:* "to accept the award without gloating".
+
+**Verify.** Head line: chin up ≥ 8°. AU panel: AU 12 small, AU 23 present.
+Classes: mild happiness or neutral. If the smile gets big it tips into
+Happiness; if the chin drops it becomes Content.
+
+---
+
+### Loving
+
+Plutchik's *love* dyad (joy + trust); the feelings wheel's *loving /
+intimate / tender*. Warmth directed at someone.
+
+**Facial signal (FACS).** Gonzaga, Keltner, Londahl & Smith (2001) coded love
+in couples as **Duchenne smiles, head nods, open-handed gestures and forward
+leans** — mostly temporal cues. The static version actors use is the
+Duchenne smile plus a **head tilt** (the affiliation signal); that's what the
+coach reads.
+
+**What the coach checks.** Hard: head tilt ≥ 8°. Soft (both): smile ·
+cheeks up (AU 6). Family: Happiness.
+
+**Method.** *Memory route:* a specific face, not a person — the moment they
+did something small and unguarded. *Body route:* soften the back of the
+neck so the head tilts, exhale, let the AU 6 crinkle arrive before the
+mouth does.
+
+**Verify.** Closest: **Loving** (a Duchenne smile with the head straight
+scores as Happiness). Head line: tilt ≥ 8°.
+
+---
+
+### Awe
+
+Plutchik's *awe* dyad (fear + surprise); the feelings wheel's *amazed*.
+Surprise that stays open instead of resolving.
+
+**Facial signal (FACS).** Cordaro 2018 core: **AU 1 + 2 + 5 + 12 + 25 +
+Jaw + 53** — eyebrows raised, upper lids raised, smile, jaw dropped, head up.
+Shiota 2003: raised inner brows (1), widened eyes (5), open drop-jawed mouth
+(26/27) in 80%, with a forward head jut and visible inhalation in about a
+quarter.
+
+**What the coach checks.** Soft (3 of 5): brows up · eyes wide · slight
+smile · jaw open · chin up ≥ 6°. Family: Surprise / Happiness / Fear.
+
+**Method.** *Memory route:* scale — a canyon edge, a night sky away from
+city light. *Body route:* a slow inhale that doesn't finish; the jaw opens
+on the inhale and the chin follows the eyes upward.
+
+**Verify.** Classes: surprise dominant, happiness second (freeplay dyad
+label *awe* appears when fear + surprise). AU panel: AU 1/2/5/26 plus a
+small 12. Head line: chin up.
+
+---
+
+### Relieved
+
+The feelings wheel's *relieved*. An emotion defined by an exhale.
+
+**Facial signal (FACS).** Cordaro 2018 core: **AU 12 + 18 + 25 + Jaw + 43 +
+head up/down + breath** — smile, lips puckered and apart, jaw dropped, lids
+drooping, and "a breath in followed by a forced breath out, usually through
+puckered and/or funneled lips". Nothing else in the 22 has AU 18 at its
+core.
+
+**What the coach checks.** Hard: lips puckered / funneled (AU 18 / 22 —
+the gate, since nothing else has it). Soft (1 of 3): lids lowered · slight
+smile · jaw slightly open. Family: Happiness / Neutral.
+
+**Method.** *Body route*, nothing else needed: fill the lungs, hold two
+seconds, blow out through pursed lips like cooling soup, and let the lids
+and shoulders drop with the air. The smile comes at the end of the breath.
+
+**Verify.** AU panel: `mouthPucker` / `mouthFunnel` active with AU 43
+partial. Closest: **Relieved** during the exhale, drifting to Content once
+the lips relax.
+
+---
+
+### Bored
+
+Plutchik's low-intensity *disgust*; the feelings wheel's *sad → bored*.
+
+**Facial signal (FACS).** Keltner 2019: **AU 43 + 55** — eyelids drooping,
+head tilted, plus (unscored) slouched posture and head resting on a hand.
+Cordaro 2018 core: 43 + head up/down. No smile, no brow raise.
+
+**What the coach checks.** Soft (both): lids lowered · head tilt ≥ 8° *or*
+chin down ≥ 8°. Hard: no smile, no inner-brow raise. Family: Neutral /
+Sadness / Contempt / Disgust.
+
+**Method.** *Action route:* "to wait for this to be over". Fix the eyes on
+a point slightly below the lens, let the head's weight go sideways onto an
+imaginary hand. Breathe slowly and shallowly. Don't *play* bored — play
+patient and let the lids fail.
+
+**Verify.** Closest: **Bored**. AU panel: AU 43 partial and nothing else.
+Head line: tilt or chin down.
+
+---
+
+### Confused
+
+The feelings wheel's *confused / bewildered*. Shares the AU 4 + 7 brow with
+Anger — the head tilt is what separates them.
+
+**Facial signal (FACS).** Keltner 2019: **AU 4 + 7 + 56** — brows furrowed,
+eyelids narrowed, head tilted. Cordaro 2018 core: 4 + 7 + head tilt
+left/right. Rozin & Cohen (2003) found this the most frequent spontaneous
+expression in everyday life, more common than any "basic" emotion face.
+
+**What the coach checks.** Hard: head tilt ≥ 8°, no smile. Soft (1 of 2):
+brows down · eyes narrowed. Family: Anger / Neutral / Sadness / Disgust /
+Fear (the classifier reads the AU 4 brow as anger).
+
+**Method.** *Action route:* "to make this add up". Look at something and
+try to read it as two things at once. The brow drops as focus narrows; the
+tilt happens when the second reading won't resolve.
+
+**Verify.** Head line: tilt ≥ 8°. AU panel: AU 4 + 7. Classes: whatever —
+often *annoyed* — the gate is permissive here.
+
+---
+
+### Embarrassed
+
+The feelings wheel's *scared → embarrassed*. The emotion that tries to hide
+while it's happening.
+
+**Facial signal (FACS).** Keltner 2019: **AU 7 + 12 + 15 + 52 + 54 + 64** —
+eyelids narrowed, *controlled* smile, head turned and down, eyes down, plus
+a hand touching the face. Cordaro 2018 core: 6 + 7 + 12 + 25 + 54 +
+"control smile" — AU 12 dampened by a second action (14, 15, 17, 23, 24).
+Keltner (1995) showed the display unfolds as a sequence: gaze down → smile
+control → head turn → face touch, over about five seconds.
+
+**What the coach checks.** Hard: chin down ≥ 8°. Soft (2 of 4): smile · a
+dampener (dimple / frown / press / lip roll) · eyes narrowed · look away
+(gaze down, gaze averted, or head turn). Family: Happiness / Neutral / Fear.
+
+**Method.** *Memory route:* a specific small public mistake — the wrong
+name, the wave returned to someone behind you. *Body route:* smile, then
+try to stop smiling with the lips while the cheeks keep going; drop the
+chin and send the eyes anywhere but the lens.
+
+**Verify.** AU panel: AU 12 together with AU 14/15/23. Head line: chin
+down; gaze line: down or averted. Closest: **Embarrassed** (if the smile
+wins, Coy; if it loses, Ashamed).
+
+---
+
+### Ashamed
+
+The feelings wheel's *sad → ashamed / guilty*; near Plutchik's *remorse*
+dyad. Embarrassment without the smile.
+
+**Facial signal (FACS).** Keltner 2019: **54 + 64** — head down, eyes down.
+Cordaro 2018 core: **4 + 17 + 54** — brows furrowed, lower lip raised, head
+down. Tracy & Matsumoto (2008) found the same head-down, chest-narrowed
+display in congenitally blind athletes after losing — it isn't learned by
+watching.
+
+**What the coach checks.** Hard: chin down ≥ 8°, no smile. Soft (1 of 3):
+brows down · chin raised (AU 17, `mouthShrugUpper`) · gaze down. Family:
+Sadness / Neutral / Fear / Disgust.
+
+**Method.** *Action route:* "to make myself smaller". Let the weight of the
+head take the chin down first; the eyes follow. Push the lower lip up as if
+swallowing a word. Keep the breath high and small.
+
+**Verify.** Head line: chin down ≥ 8°. Gaze line: down. AU panel: AU 17 and
+AU 4. Classes: sad / neutral.
+
+---
+
+### Sympathetic
+
+Compassion — the feelings wheel's *peaceful → nurturing / caring*. Sadness
+pointed at someone else.
+
+**Facial signal (FACS).** Keltner 2019: **AU 1 + 17 + 24 + 57** — inner
+eyebrow raised, lower lip raised, lips pressed together, head slightly
+forward. Cordaro 2018 core was leaner (25 + Jaw + 57 — lips parted, head
+forward); the coach uses Keltner's fuller pattern, which is what actors are
+taught as the "oblique brow".
+
+**What the coach checks.** Hard: inner brows up (AU 1 — without it a
+resting face passes), no smile. Soft (1 of 3): chin raised (AU 17) · lips
+pressed (AU 24) · head forward / down ≥ 8°. Family: Sadness / Neutral.
+
+**Method.** *Action route:* "to take some of this off you". Listen to
+someone describe a loss; the inner brows rise with the inhale, the lips
+press to keep from interrupting, the head comes toward them.
+
+**Verify.** AU panel: AU 1 with AU 17/23. Classes: *pensive* or neutral.
+If AU 15 appears it's your own sadness, not theirs.
+
+---
+
+### Pain
+
+The feelings wheel's *sad → hurt*, physical or otherwise. The most muscular
+face in the set.
+
+**Facial signal (FACS).** Cordaro 2018 core: **AU 4 + 6 + 7 + 20 + 25 + 43
++ head up/down** — brows furrowed, eyes tightly closed, lips stretched and
+parted. Keltner 2019: 4 + 6 + 7 + 9 + 17 + 18 + 23 + 24. Prkachin (1992)
+identified the core pain actions as **4, 6/7, 9/10 and 43** across four
+different kinds of pain.
+
+**What the coach checks.** Soft (3 of 6): brows down · cheeks up · eyes
+narrowed · nose wrinkled · lips stretched · lids lowered. Family: Disgust /
+Anger / Sadness / Fear.
+
+**Method.** *Sense memory* (Strasberg): a specific location — a stubbed toe,
+a burned fingertip. Clamp the eyes first; the brow and nose follow. Breath
+in through the teeth gives AU 20 for free.
+
+**Verify.** AU panel: AU 4 + 6 + 7 + 9 + 20 together — more AUs lit than
+any other target. Classes: disgust or anger dominant.
+
+---
+
+### Coy
+
+The feelings wheel's *happy → playful*; flirtation. A Duchenne smile that
+hides.
+
+**Facial signal (FACS).** Keltner 2019: **AU 6 + 7 + 12 + 25 + 26 + 52 +
+54 + 61** — Duchenne smile, lips separated, head turned and down, eyes
+turned *opposite* to the head turn. Cordaro 2018 core: 6 + 7 + 12 + 25 + 54.
+Reddy (2000) documented the same display in infants as young as two months.
+
+**What the coach checks.** Hard: chin down ≥ 8°. Soft (2 of 3): smile ·
+cheeks up · look away (gaze averted, gaze down, or head turn ≥ 10°).
+Family: Happiness.
+
+**Method.** *Action route:* "to be caught looking". Smile fully, drop and
+turn the head as if to hide it, and let the eyes come back to the lens
+last. The eyes-opposite-the-head is the signature — practise it slowly.
+
+**Verify.** Closest: **Coy**. Head line: chin down, turn ≥ 10°. Gaze line:
+averted. If the smile is dampened it becomes Embarrassed; head straight is
+Happiness.
+
+---
+
+### Anxious
+
+Plutchik's low-intensity *fear* (apprehension); the feelings wheel's
+*scared → anxious / insecure*. Not one of Cordaro's 22 — this recipe is
+**derived**, not measured.
+
+**Facial signal (FACS).** Built from Ekman & Friesen's fear brow — **AU 1 +
+2 + 4**, inner brows raised *and* drawn together — the "worry brow" variant
+(1 + 4) that appears without AU 2, and the **lip stretch (AU 20)** or
+**lip press (23/24)** fear shares with anger. Plus the gaze shifting actors
+use. Treat it as a reliable acting convention rather than a cross-cultural
+finding.
+
+**What the coach checks.** Soft (2 of 4): inner brows up · brows down ·
+lips stretched or pressed · look away (gaze down / averted / head turn).
+Hard: no smile. Family: Fear / Sadness / Neutral.
+
+**Method.** *Memory route:* waiting for a result — the five minutes before
+news. *Body route:* breath high and fast and shallow; the brows go up and
+together on the held inhale, the lips stretch flat. Let the eyes check the
+edges of the frame.
+
+**Verify.** AU panel: AU 1 + 4 together (the knit), AU 20 or 23. Gaze
+line: moving. Classes: *apprehensive* or neutral. If AU 5 appears you've
+crossed into Fear.
+
+---
+
 ## Blendshape → AU mapping reference
 
 The webcam tool detects 52 ARKit-style **blendshapes** via MediaPipe and
@@ -835,7 +1306,12 @@ the mapping used:
 | AU 20 Lip stretcher | `mouthStretchLeft`, `mouthStretchRight` |
 | AU 23 Lip tightener | `mouthPressLeft`, `mouthPressRight` |
 | AU 25/26 Jaw drop | `jawOpen` (thresholded by magnitude) |
-| AU 43 Eyes closed | `eyeBlinkLeft`, `eyeBlinkRight` |
+| AU 43 Eyes closed | `eyeBlinkLeft`, `eyeBlinkRight` (≥ 0.20 counts as "lids drooping" in the wheel recipes) |
+| AU 18 / 22 Lip pucker / funnel | `mouthPucker`, `mouthFunnel` (Relieved) |
+| AU 61–64 Gaze | `eyeLookDown*`, `eyeLookUp*`, `eyeLookIn*` / `eyeLookOut*` (averted = both eyes swung the same way) |
+| 53 / 54 Chin up / down | pitch from the head-pose matrix |
+| 55 / 56 Head tilt | roll from the head-pose matrix |
+| 51 / 52 Head turn | yaw from the head-pose matrix |
 
 Caveats:
 - Blendshapes are a proxy for true FACS. They're calibrated for 3D avatars,
@@ -846,5 +1322,10 @@ Caveats:
   are per-side — if `mouthDimpleLeft - mouthDimpleRight` is large, that's
   asymmetric and flagged as AU 14L or AU 14R.
 - The overlay shows AUs that are active at ≥ threshold (default 0.25).
-  Tweak `AU_DISPLAY_THRESHOLD` in `webcam_emotion.py` if the panel is too
+  Tweak `AU_DISPLAY_THRESHOLD` in `emotion_lib.py` if the panel is too
   empty or too busy.
+- Head pose comes from MediaPipe's facial transformation matrix (the face's
+  local axes in camera space). It's relative to the *camera*, not to
+  gravity — a laptop camera below eye level reads a few degrees of chin-down
+  at rest. Check the freeplay head line with a neutral face before trusting
+  the pitch cues, and raise `HEAD_PITCH_DEG` if needed.
